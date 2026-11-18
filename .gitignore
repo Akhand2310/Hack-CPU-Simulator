@@ -1,0 +1,15 @@
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated waveforms and assembled binaries
+*.vcd
+examples/*.hack
+
+# App-local runtime metadata (run.md is committed; this file is not source)
+.freebuff/project-id

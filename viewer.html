@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<!--
+  viewer.html — standalone VCD waveform viewer (phase-2 deliverable).
+
+  Reads a .vcd file (produced by main.py / vcd_writer.py) entirely in the
+  browser: no server, no dependencies.  Supports change-only VCDs with
+  $var declarations, #timestamps, b<bits> <id> vector lines and [01]<id>
+  scalar lines.
+
+  Usage: open this file, pick your signals.vcd (or drag & drop it),
+  click signal names to toggle rows, drag horizontally on the canvas to
+  zoom to a time range, hover for a cursor with exact values.
+  Cycle = VCD time / 10 (one 10 ns period per CPU cycle).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Hack CPU VCD Viewer</title>
+<style>
+  :root {
+    --bg: #101418; --panel: #1a2028; --panel2: #12161c; --line: #2a323c;
+    --text: #d8dee6; --dim: #8a94a0; --accent: #4fc3f7; --wire: #42a5f5;
+    --hi: #ffd54f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, sans-serif; height: 100vh;
+         display: flex; flex-direction: column; }
+  header { padding: 8px 14px; background: var(--panel);
+           border-bottom: 1px solid var(--line);
+           display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0 6px 0 0; color: var(--accent); }
+  button { background: #263040; color: var(--text); border: 1px solid var(--line);
+           border-radius: 6px; padding: 5px 12px; cursor: pointer; font: inherit; }
+  button:hover { background: #31405a; }
+  #drop { border: 2px dashed var(--line); padding: 4px 10px; border-radius: 6px;
+          color: var(--dim); }
+  #drop.over { border-color: var(--accent); color: var(--accent); }
+  main { flex: 1; display: flex; min-height: 0; }
+  #names { width: 200px; overflow-y: auto; background: var(--panel2);
+           border-right: 1px solid var(--line); padding: 6px 0; flex-shrink: 0; }
+  .name { padding: 4px 12px; cursor: pointer; display: flex;
+          justify-content: space-between; white-space: nowrap; }
+  .name:hover { background: #202a36; }
+  .name.hidden { color: var(--dim); text-decoration: line-through; }
+  .name .id { color: var(--dim); font-size: 11px; margin-left: 8px; }
+  #canvasWrap { flex: 1; overflow: hidden; position: relative; }
+  canvas { display: block; cursor: crosshair; }
+  #hover { position: fixed; pointer-events: none; background: #000c; color: #fff;
+           padding: 5px 9px; border-radius: 4px; font: 12px/1.5 ui-monospace, monospace;
+           display: none; white-space: pre; z-index: 10;
+           border: 1px solid var(--line); }
+  .hint { color: var(--dim); font-size: 12px; }
+  .status { color: var(--dim); font-size: 12px; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hack CPU VCD Viewer</h1>
+  <input type="file" id="file" accept=".vcd">
+  <span id="drop">or drop a .vcd here</span>
+  <button id="zoomIn">Zoom in</button>
+  <button id="zoomOut">Zoom out</button>
+  <button id="zoomFit">Fit</button>
+  <button id="showAll">Show all</button>
+  <button id="demo">Demo</button>
+  <span class="hint">drag on canvas to zoom &middot; hover for values &middot; click names to toggle</span>
+  <span class="status" id="status">no file loaded</span>
+</header>
+<main>
+  <div id="names"></div>
+  <div id="canvasWrap"><canvas id="canvas"></canvas></div>
+</main>
+<div id="hover"></div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// VCD parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse VCD text into:
+ *   defs    : [{id, name, width}] in declaration order
+ *   segs    : Map(id -> [{t0, t1, v}]) — value segments (v is an int)
+ *   endtime : last timestamp seen
+ * Signals are assumed 0 until their first change (reset state).
+ */
+function parseVCD(text) {
+  const defs = [];
+  const changes = new Map();          // id -> [{t, v}] in time order
+  const ids = new Map();              // id -> width
+  let currentTime = 0;
+  let inDefs = true;
+  let endtime = 0;
+
+  const toInt = (bits, width) => parseInt(bits.replace(/[^01]/g, "0"), 2) &
+                                 ((1 << width) - 1);
+
+  const push = (id, v, t) => {
+    if (!ids.has(id)) return;         // ignore ids not declared in $vars
+    let list = changes.get(id);
+    if (!list) { list = []; changes.set(id, list); }
+    const last = list[list.length - 1];
+    if (!last || last.v !== v) list.push({ t, v });
+    if (t > endtime) endtime = t;
+  };
+
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (inDefs) {
+      const m = line.match(/^\$var\s+\S+\s+(\d+)\s+(\S+)\s+(\S+)\s+\$end$/);
+      if (m) {
+        // Some VCDs append a second name field; first name is fine for us.
+        defs.push({ id: m[2], name: m[3], width: +m[1] });
+        ids.set(m[2], +m[1]);
+        changes.set(m[2], []);
+      } else if (line === "$enddefinitions $end") {
+        inDefs = false;
+      }
+      continue;
+    }
+    if (line[0] === "#") {
+      currentTime = parseInt(line.slice(1), 10);
+      continue;
+    }
+    if (line[0] === "b") {
+      const m = line.match(/^b([01xXzZ]+)\s+(\S+)$/);
+      if (m) push(m[2], toInt(m[1], ids.get(m[2])), currentTime);
+      continue;
+    }
+    // scalar: value char followed by the id, e.g. "1c"
+    if (line.length >= 2 && "01xXzZ".includes(line[0]) && ids.has(line.slice(1))) {
+      const id = line.slice(1);
+      push(id, line[0] === "1" ? 1 : 0, currentTime);
+    }
+    // anything else ($dumpvars, $comment bodies, ...) is ignored
+  }
+
+  // Build segment lists: each change runs until the next change.
+  const segs = new Map();
+  for (const d of defs) {
+    const chs = changes.get(d.id) || [];
+    const list = [];
+    for (let i = 0; i < chs.length; i++) {
+      list.push({ t0: chs[i].t, t1: i + 1 < chs.length ? chs[i + 1].t : endtime + 10, v: chs[i].v });
+    }
+    if (!list.length) list.push({ t0: 0, t1: endtime + 10, v: 0 });
+    segs.set(d.id, list);
+  }
+  return { defs, segs, endtime: endtime + 10 };
+}
+
+/** Value of a signal at time t (0 before its first change). */
+function valueAt(segs, t) {
+  let lo = 0, hi = segs.length - 1;
+  if (t < segs[0].t0) return 0;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (segs[mid].t0 <= t) lo = mid; else hi = mid - 1;
+  }
+  return segs[lo].v;
+}
+
+// ---------------------------------------------------------------------------
+// Viewer state + rendering
+// ---------------------------------------------------------------------------
+const ROW_H = 26, WIRE_H = 8, LEFT_PAD = 8, RIGHT_PAD = 10, CYCLE = 10;
+let data = null;                 // parseVCD result
+let hidden = new Set();          // ids hidden from the wave view
+let view = { start: 0, end: 100 };
+let cursorT = null;              // hovered time
+let dragStart = null;            // {x, t} while drag-zooming
+let dragNow = null;
+
+const canvas = document.getElementById("canvas");
+const wrap = document.getElementById("canvasWrap");
+const hover = document.getElementById("hover");
+
+function fmtVal(d, v) {
+  if (d.width === 1) return String(v);
+  return "0x" + v.toString(16).toUpperCase().padStart(Math.ceil(d.width / 4), "0");
+}
+
+function timeToPx(t) {
+  const W = wrap.clientWidth;
+  return LEFT_PAD + (t - view.start) / (view.end - view.start) * (W - LEFT_PAD - RIGHT_PAD);
+}
+function pxToTime(x) {
+  const W = wrap.clientWidth;
+  return view.start + (x - LEFT_PAD) / (W - LEFT_PAD - RIGHT_PAD) * (view.end - view.start);
+}
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#101418";
+  ctx.fillRect(0, 0, W, H);
+  if (!data) {
+    ctx.fillStyle = "#8a94a0";
+    ctx.font = "14px system-ui";
+    ctx.fillText("Load a .vcd file to see waveforms.", 20, 30);
+    return;
+  }
+
+  const visible = data.defs.filter(d => !hidden.has(d.id));
+
+  // ---- cycle grid (every 10 ns = 1 instruction cycle) ----
+  const pxPerCycle = CYCLE / (view.end - view.start) * (W - LEFT_PAD - RIGHT_PAD);
+  if (pxPerCycle >= 8) {
+    ctx.strokeStyle = "#1c232c";
+    ctx.beginPath();
+    const first = Math.ceil(view.start / CYCLE) * CYCLE;
+    for (let t = first; t <= view.end; t += CYCLE) {
+      const x = Math.round(timeToPx(t)) + 0.5;
+      ctx.moveTo(x, 0); ctx.lineTo(x, visible.length * ROW_H);
+    }
+    ctx.stroke();
+  }
+  // cycle number labels, sparse enough to fit
+  const labelEvery = Math.max(1, Math.ceil(46 / pxPerCycle));
+  ctx.fillStyle = "#8a94a0";
+  ctx.font = "11px ui-monospace, monospace";
+  const firstC = Math.ceil(view.start / CYCLE);
+  for (let c = firstC - (firstC % labelEvery); c * CYCLE <= view.end; c += labelEvery) {
+    if (c < 0) continue;
+    ctx.fillText(String(c), timeToPx(c * CYCLE) + 2, visible.length * ROW_H + 14);
+  }
+
+  // ---- rows ----
+  visible.forEach((d, i) => {
+    const y0 = i * ROW_H, cy = y0 + ROW_H / 2;
+    ctx.strokeStyle = "#232b35";                       // row separator
+    ctx.beginPath();
+    ctx.moveTo(0, y0 + ROW_H + 0.5); ctx.lineTo(W, y0 + ROW_H + 0.5);
+    ctx.stroke();
+
+    const segs = data.segs.get(d.id);
+    const yHi = d.width === 1 ? cy - 7 : cy - WIRE_H;
+    const yLo = d.width === 1 ? cy + 7 : cy + WIRE_H;
+    ctx.strokeStyle = "#42a5f5";
+    ctx.fillStyle = "#b9c6d4";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+
+    for (let s = 0; s < segs.length; s++) {
+      const seg = segs[s];
+      if (seg.t1 <= view.start || seg.t0 >= view.end) continue;
+      const x0 = timeToPx(Math.max(seg.t0, view.start));
+      const x1 = timeToPx(Math.min(seg.t1, view.end));
+      const yV = seg.v ? yHi : yLo;
+      if (d.width === 1) {
+        ctx.moveTo(x0, yV); ctx.lineTo(x1, yV);        // square wave level
+        const next = segs[s + 1];
+        if (next && next.t0 > seg.t0 && next.t0 < view.end) {
+          const xt = timeToPx(next.t0);
+          ctx.moveTo(xt, yV); ctx.lineTo(xt, next.v ? yHi : yLo);   // edge
+        }
+      } else {
+        ctx.moveTo(x0, yHi); ctx.lineTo(x1, yHi);      // bus top
+        ctx.moveTo(x0, yLo); ctx.lineTo(x1, yLo);      // bus bottom
+        const next = segs[s + 1];
+        if (next && next.t0 > seg.t0 && next.t0 < view.end) {
+          const xt = timeToPx(next.t0);                // transition "X"
+          ctx.moveTo(xt - 4, yHi); ctx.lineTo(xt + 4, yLo);
+          ctx.moveTo(xt - 4, yLo); ctx.lineTo(xt + 4, yHi);
+        }
+        if (x1 - x0 > 34) {                            // value label
+          ctx.font = "11px ui-monospace, monospace";
+          ctx.fillText(fmtVal(d, seg.v), x0 + 4, cy + 4);
+        }
+      }
+    }
+    ctx.stroke();
+    ctx.lineWidth = 1;
+  });
+
+  // ---- drag-zoom selection shading ----
+  if (dragStart && dragNow && Math.abs(dragNow.x - dragStart.x) > 3) {
+    ctx.fillStyle = "rgba(79,195,247,0.15)";
+    ctx.fillRect(Math.min(dragStart.x, dragNow.x), 0,
+                 Math.abs(dragNow.x - dragStart.x), visible.length * ROW_H);
+  }
+
+  // ---- hover cursor ----
+  if (cursorT !== null) {
+    const x = Math.round(timeToPx(cursorT)) + 0.5;
+    ctx.strokeStyle = "#ffd54f";
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, visible.length * ROW_H); ctx.stroke();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Interaction
+// ---------------------------------------------------------------------------
+function setView(start, end) {
+  view = { start, end: Math.max(end, start + 1) };
+  draw();
+}
+function zoom(factor) {
+  const center = (view.start + view.end) / 2;
+  const half = (view.end - view.start) / 2 * factor;
+  setView(Math.max(0, center - half), center + half);
+}
+
+canvas.addEventListener("mousedown", e => {
+  dragStart = { x: e.offsetX, t: pxToTime(e.offsetX) };
+  dragNow = null;
+});
+window.addEventListener("mousemove", e => {
+  if (dragStart) {
+    const rect = canvas.getBoundingClientRect();
+    dragNow = { x: e.clientX - rect.left };
+    draw();
+  }
+});
+window.addEventListener("mouseup", e => {
+  if (!dragStart) return;
+  const rect = canvas.getBoundingClientRect();
+  const x1 = e.clientX - rect.left;
+  if (Math.abs(x1 - dragStart.x) > 5 && x1 >= 0 && x1 <= rect.width) {
+    const t1 = pxToTime(x1);
+    setView(Math.max(0, Math.min(dragStart.t, t1)), Math.max(dragStart.t, t1));
+  }
+  dragStart = dragNow = null;
+  draw();
+});
+canvas.addEventListener("mousemove", e => {
+  if (!data) return;
+  cursorT = Math.min(Math.max(pxToTime(e.offsetX), view.start), view.end);
+  const visible = data.defs.filter(d => !hidden.has(d.id));
+  const lines = ["t=" + Math.round(cursorT) + "ns  cycle " + (cursorT / CYCLE)];
+  for (const d of visible) {
+    lines.push(d.name + " = " + fmtVal(d, valueAt(data.segs.get(d.id), cursorT)));
+  }
+  hover.textContent = lines.join("\n");
+  hover.style.display = "block";
+  hover.style.left = Math.min(e.clientX + 14, window.innerWidth - 190) + "px";
+  hover.style.top = (e.clientY + 14) + "px";
+  draw();
+});
+canvas.addEventListener("mouseleave", () => {
+  cursorT = null; hover.style.display = "none"; draw();
+});
+window.addEventListener("resize", draw);
+
+document.getElementById("zoomIn").onclick = () => zoom(1 / 1.5);
+document.getElementById("zoomOut").onclick = () => zoom(1.5);
+document.getElementById("zoomFit").onclick =
+  () => data && setView(0, data.endtime);
+document.getElementById("showAll").onclick = () => {
+  hidden.clear();
+  buildNameList();
+  draw();
+};
+
+// Built-in sample waveform (looks like the first 24 cycles of
+// sum1to10.asm) so the viewer can be tried without a file.
+document.getElementById("demo").onclick = () => loadText(demoVCD(), "demo");
+
+function demoVCD() {
+  const lines = [
+    "$timescale 1ns $end", "$scope module hack_cpu $end",
+    "$var wire 1 c clk $end", "$var wire 16 p pc $end",
+    "$var wire 16 a A $end", "$var wire 16 d D $end",
+    "$var wire 16 u ALU $end", "$var wire 16 i instruction $end",
+    "$var wire 16 m addressM $end", "$var wire 16 o outM $end",
+    "$var wire 1 z zr $end", "$var wire 1 n ng $end",
+    "$var wire 1 w writeM $end", "$var wire 16 r ram0 $end",
+    "$upscope $end", "$enddefinitions $end", "#0",
+  ];
+  const bin = v => "b" + (v & 0xffff).toString(2).padStart(16, "0");
+  const emit = (t, vals) => {
+    lines.push("#" + t);
+    if (vals.clk !== undefined) lines.push(vals.clk + "c");
+    for (const [id, v] of Object.entries(vals)) {
+      if (id === "clk") continue;
+      if (id === "zr" || id === "ng" || id === "writeM") {
+        lines.push((v ? 1 : 0) + id[0]);
+      } else if (id !== "clk") {
+        lines.push(bin(v) + " " + id[0]);
+      }
+    }
+  };
+  // A few interesting cycles: setup, a loop iteration, a write, a jump.
+  const cycles = [
+    { clk: 1, pc: 1, A: 10, ALU: 0, instruction: 0x000a, addressM: 0, outM: 0 },
+    { clk: 1, pc: 2, A: 16, ALU: 10, instruction: 0xec10, addressM: 10, outM: 10 },
+    { clk: 1, pc: 3, A: 16, ALU: 10, instruction: 0xe308, addressM: 16, outM: 10, writeM: 1 },
+    { clk: 1, pc: 8, A: 17, ALU: 0, instruction: 0x0011, addressM: 16, outM: 0 },
+    { clk: 1, pc: 9, A: 17, ALU: 1, instruction: 0xfdd8, addressM: 17, outM: 1, writeM: 1, zr: 0, ng: 0 },
+    { clk: 1, pc: 10, A: 17, ALU: 1, instruction: 0x0011, addressM: 17, outM: 1 },
+    { clk: 1, pc: 11, A: 17, D: 1, ALU: 1, instruction: 0xfc10, addressM: 17, outM: 1 },
+    { clk: 1, pc: 12, A: 18, D: 1, ALU: 0, instruction: 0x0012, addressM: 17, outM: 0 },
+    { clk: 1, pc: 13, A: 18, D: 1, ALU: 1, instruction: 0xf088, addressM: 18, outM: 1, writeM: 1 },
+    { clk: 1, pc: 14, A: 18, D: 1, ALU: 1, instruction: 0x0011, addressM: 18, outM: 1 },
+    { clk: 1, pc: 15, A: 17, D: 1, ALU: 1, instruction: 0xfc10, addressM: 18, outM: 1 },
+    { clk: 1, pc: 16, A: 17, D: 1, ALU: 0, instruction: 0x0010, addressM: 17, outM: 1 },
+    { clk: 1, pc: 17, A: 16, D: 1, ALU: -9, instruction: 0xfd50, addressM: 16, outM: -9, ng: 1 },
+    { clk: 1, pc: 20, A: 8, D: -9, ALU: 0, instruction: 0x0008, addressM: 16, outM: -9 },
+    { clk: 1, pc: 8, A: 8, D: -9, ALU: 0, instruction: 0xea87, addressM: 8, outM: 0 },
+  ];
+  let t = 0;
+  emit(0, {});                      // t0: reset dump
+  for (const c of cycles) {
+    t += 5;
+    emit(t, c);                     // rising edge: registers latch
+    t += 5;
+    emit(t, { clk: 0 });            // falling edge: clock only
+  }
+  return lines.join("\n") + "\n";
+}
+
+function buildNameList() {
+  const names = document.getElementById("names");
+  names.innerHTML = "";
+  if (!data) return;
+  for (const d of data.defs) {
+    const row = document.createElement("div");
+    row.className = "name" + (hidden.has(d.id) ? " hidden" : "");
+    row.innerHTML = "<span>" + d.name + "</span><span class='id'>" + d.id + "</span>";
+    row.onclick = () => {
+      if (hidden.has(d.id)) hidden.delete(d.id); else hidden.add(d.id);
+      row.classList.toggle("hidden");
+      draw();
+    };
+    names.appendChild(row);
+  }
+}
+
+function loadText(text, label) {
+  data = parseVCD(text);
+  hidden.clear();
+  view = { start: 0, end: Math.max(data.endtime, CYCLE) };
+  buildNameList();
+  draw();
+  document.getElementById("status").textContent =
+    label + ": " + data.defs.length + " signals, " +
+    (data.endtime / CYCLE) + " cycles";
+}
+
+document.getElementById("file").addEventListener("change", e => {
+  const f = e.target.files[0];
+  if (f) f.text().then(t => loadText(t, f.name));
+});
+
+const drop = document.getElementById("drop");
+document.body.addEventListener("dragover", e => {
+  e.preventDefault(); drop.classList.add("over");
+});
+document.body.addEventListener("dragleave", () => drop.classList.remove("over"));
+document.body.addEventListener("drop", e => {
+  e.preventDefault(); drop.classList.remove("over");
+  const f = e.dataTransfer.files[0];
+  if (f) f.text().then(t => loadText(t, f.name));
+});
+
+draw();
+</script>
+</body>
+</html>
